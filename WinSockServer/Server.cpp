@@ -4,12 +4,13 @@
 #include <string.h>
 
 #include "../Common/QueueHeader.h"
+#include "../Common/TaskHeader.h"
 
 #define DEFAULT_BUFLEN 512
 #define DEFAULT_PORT "27016"
 #define MAX_CLIENT 10
 #define SAFE_DELETE_HANDLE(a) if(a){CloseHandle(a);} 
-#define THREAD_POOL_SIZE 12
+#define THREAD_POOL_SIZE 5
 
 HANDLE hAddToQueueSemaphore;
 HANDLE hGetQueueDataSemaphore;
@@ -21,14 +22,15 @@ CRITICAL_SECTION getQueueDataCS;
 CRITICAL_SECTION tasksUpdateCS;
 
 struct Queue* queue;
+struct Task* task;
 int tasksCount = 0;
+int counter = 0;
 
 bool InitializeWindowsSockets();
 void Decomposition(SOCKET* acceptedSockets, int indexDeleted, int indexCurrentSize);
 void WriteInFile(int data, int workerRole);
 
 DWORD WINAPI addToQueue(LPVOID lpParam);
-//DWORD WINAPI getQueueData(LPVOID lpParam);
 DWORD WINAPI sendToThreadPool(LPVOID lpParam);
 DWORD WINAPI sendToWR(LPVOID lpParam);
 
@@ -39,16 +41,15 @@ int main(void)
 	char recvbuf[DEFAULT_BUFLEN];
 	char recvData[10];
 	queue = createQueue(12);
+	task = createTasks(10);
 
 	SOCKET listenSocket = INVALID_SOCKET;
 
 	DWORD addToQueueThreadID;
-	//DWORD getQueueDataThreadID;
 	DWORD sendToThreadPoolThreadID;
 	DWORD threadPoolThreadID[THREAD_POOL_SIZE];
 
 	HANDLE hAddToQueueThread;
-	//HANDLE hGetQueueDataThread;
 	HANDLE hSendToThreadPoolThread;
 	HANDLE hThreadPoolThread[THREAD_POOL_SIZE];
 
@@ -56,11 +57,6 @@ int main(void)
 	if (hAddToQueueSemaphore) {
 		hAddToQueueThread = CreateThread(NULL, 0, &addToQueue, recvData, 0, &addToQueueThreadID);
 	}
-
-	/*hGetQueueDataSemaphore = CreateSemaphore(0, 0, 1, NULL);
-	if (hGetQueueDataSemaphore) {
-		hGetQueueDataThread = CreateThread(NULL, 0, &getQueueData, NULL, 0, &getQueueDataThreadID);
-	}*/
 
 	hSendToThreadPoolSemaphore = CreateSemaphore(0, 0, 1, NULL);
 	if (hSendToThreadPoolSemaphore) {
@@ -70,7 +66,9 @@ int main(void)
 	hSendToWRSemaphore = CreateSemaphore(0, 0, 1, NULL);
 	if (hSendToWRSemaphore) {
 		for (int i = 0; i < THREAD_POOL_SIZE; i++) {
-			hThreadPoolThread[i] = CreateThread(NULL, 0, &sendToWR, NULL, 0, &threadPoolThreadID[i]);
+			char temp[10];
+			itoa(i, temp, 10);
+			hThreadPoolThread[i] = CreateThread(NULL, 0, &sendToWR, temp, 0, &threadPoolThreadID[i]);
 		}
 	}
 
@@ -209,9 +207,6 @@ int main(void)
 
 	SAFE_DELETE_HANDLE(hAddToQueueSemaphore);
 	SAFE_DELETE_HANDLE(hAddToQueueThread);
-
-	//SAFE_DELETE_HANDLE(hGetQueueDataSemaphore);
-	//SAFE_DELETE_HANDLE(hGetQueueDataThread);
 	
 	SAFE_DELETE_HANDLE(hSendToThreadPoolSemaphore);
 	SAFE_DELETE_HANDLE(hSendToThreadPoolThread);
@@ -248,13 +243,14 @@ void Decomposition(SOCKET* acceptedSockets, int indexDeleted, int indexCurrentSi
 
 void WriteInFile(int data, int workerRole) {
 	const char* filename = "temp.txt";
+
 	FILE *fp = fopen(filename, "a");
 	if (fp == NULL) {
 		printf("Error opening the file %s", filename);
 		return;
 	}
-
-	fprintf(fp, "\nWorker role %d: %d", workerRole, data);
+	
+	fprintf(fp, "Worker role %d: %d\n", workerRole, data);
 	fclose(fp);
 }
 
@@ -265,32 +261,31 @@ DWORD WINAPI addToQueue(LPVOID lpParam) {
 			char* temp = (char*)lpParam;
 			enqueue(queue, atoi(temp));
 			printf("Enqueued data: %s\n", temp);
+			counter++;
 		LeaveCriticalSection(&addToQueueCS);
+
+		if (counter > 3)
+			ReleaseSemaphore(hSendToThreadPoolSemaphore, 1, NULL);
 	}
 }
 
-/*DWORD WINAPI getQueueData(LPVOID lpParam) {
-	while (true) {
-		WaitForSingleObject(hGetQueueDataSemaphore, INFINITE);
-		EnterCriticalSection(&getQueueDataCS);
-			printf("\tDequeued data from queue: %d\n", dequeue(queue));
-		LeaveCriticalSection(&getQueueDataCS);
-	}
-}*/
-
 DWORD WINAPI sendToThreadPool(LPVOID lpParam) {
+	int tempData;
 	while (true) {
 		WaitForSingleObject(hSendToThreadPoolSemaphore, INFINITE);
 
 		EnterCriticalSection(&getQueueDataCS);
 			//preuzmi podatak iz reda
+			tempData = dequeue(queue);
 		LeaveCriticalSection(&getQueueDataCS);
 		
 		EnterCriticalSection(&tasksUpdateCS);
 			//kreiranje novog taska
+			addTask(task, tempData);
+			tasksCount++;
 		LeaveCriticalSection(&tasksUpdateCS);
 
-		if (tasksCount > 0)
+		if (tasksCount > 3)
 			ReleaseSemaphore(hSendToWRSemaphore, 1, NULL);
 	}
 }
@@ -300,7 +295,9 @@ DWORD WINAPI sendToWR(LPVOID lpParam) {
 		WaitForSingleObject(hSendToWRSemaphore, INFINITE);
 
 		EnterCriticalSection(&tasksUpdateCS);
-			//preuzimanje taska i prosledjivanje metodi writeInFile
+			//preuzimanje taska i prosledjivanje metodi writeInFile		
+			WriteInFile(getTask(task), atoi((char*)lpParam));
+			tasksCount--;
 		LeaveCriticalSection(&tasksUpdateCS);
 
 		if (tasksCount > 0)
