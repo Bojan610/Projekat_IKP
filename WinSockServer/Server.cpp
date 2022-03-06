@@ -2,84 +2,120 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "../Common/QueueHeader.h"
-#include "../Common/TaskHeader.h"
 
 #define DEFAULT_BUFLEN 512
-#define DEFAULT_PORT "27016"
-#define MAX_CLIENT 10
+#define DEFAULT_PORT "5059"
 #define SAFE_DELETE_HANDLE(a) if(a){CloseHandle(a);} 
-#define THREAD_POOL_SIZE 5
+#define THREAD_POOL_SIZE 100
 
 HANDLE hAddToQueueSemaphore;
-HANDLE hGetQueueDataSemaphore;
-HANDLE hSendToThreadPoolSemaphore;
-HANDLE hSendToWRSemaphore;
+HANDLE hLoadBalancerThread1Semaphore;
+HANDLE hThreadPoolSemaphore[THREAD_POOL_SIZE];
+HANDLE hThreadPoolSemaphoreFinish[THREAD_POOL_SIZE];
+HANDLE hThreadPoolThread[THREAD_POOL_SIZE];
 
-CRITICAL_SECTION addToQueueCS;
-CRITICAL_SECTION getQueueDataCS;
-CRITICAL_SECTION tasksUpdateCS;
+CRITICAL_SECTION QueueCS;
 
+// inicijalizacija reda koriscenog iz "Common" projekta
 struct Queue* queue;
-struct Task* task;
-int tasksCount = 0;
+
+// niz zauzetih worker role-a
+bool busyThreads[THREAD_POOL_SIZE];
 int counter = 0;
 
+// trenutan broj worker role-a
+int numOfWorkerRoles = -1;
+
 bool InitializeWindowsSockets();
-void Decomposition(SOCKET* acceptedSockets, int indexDeleted, int indexCurrentSize);
+
+/* 
+	Funkcija: WriteInFile
+	---------------------------------------------------
+	Funkcionalnost: Upis podatka preuzetog iz reda u txt file
+
+	Parametri: 'data' - podatak koji se upisuje u file
+			   'workerRole' - id worker role koja je obradila podatak i pozvala ovu metodu
+
+	Povratna vrednost: /
+*/
 void WriteInFile(int data, int workerRole);
 
+/*	* addToQueue *
+	- Funkcija koja se izvrsava kada semafor "hAddToQueueSemaphore" da dozvolu niti "hAddToQueueThread"
+	  da se izvrsi
+	- Zadatak joj je da podatak primljen od klijenta upise u red i nakon toga aktivira semafor "hLoadBalancerThread1Semaphore"
+*/
 DWORD WINAPI addToQueue(LPVOID lpParam);
-DWORD WINAPI sendToThreadPool(LPVOID lpParam);
-DWORD WINAPI sendToWR(LPVOID lpParam);
+
+/*	* loadBalancerThread1 *
+	- Funkcija koja se izvrsava kada semafor "hLoadBalancerThread1Semaphore" da dozvolu niti 
+	  "loadBalancerThread1" da se izvrsi
+	- Zadatak joj je da nadje slobodnu worker role-u i obavesti da ce se sledeci podatak slati nadjenoj roli
+*/
+DWORD WINAPI loadBalancerThread1(LPVOID lpParam);
+
+/*	* loadBalancerThread2 *
+	- Nit "hLoadBalancerThread2" se izvrsava konstantno i u toku njenog rada se izvrsava ova funkcija
+	- Zadatak joj je da na svake 2 sekunde proverava popunjenost reda i da u zavisnosti od popunjenosti:
+		- ako je preko 70% - kreira nove semafore i niti (worker role)
+		- ako je ispod 30% - da dozvolu da se odredjena worker role-a izbrise preko semafora hThreadPoolSemaphoreFinish
+*/
+DWORD WINAPI loadBalancerThread2(LPVOID lpParam);
+
+/*	* workerRole *
+	- Obzirom da broj worker role-i varira, implementiran je niz niti "hThreadPoolThread",
+	  kao i nizovi semafora "hThreadPoolSemaphore" i "hThreadPoolSemaphoreFinish"
+	- Kada se kreira nova worker role-a pocinje da se izvrsava ova funkcija koja ceka dozvolu nekog od 
+	  2 pomenuta tipa semafora:
+		- na dozvolu "hThreadPoolSemaphore" preuzima se podatak iz reda, izvrsi se zamisljena obrada 
+		  u trajanju od 7 sekundi i nakon toga se podatak upise u txt file
+		- na dozvolu "hThreadPoolSemaphoreFinish" odredjena worker role-a se brise,
+		  tacnije njena nit i 2 tipa semafora
+*/
+DWORD WINAPI workerRole(LPVOID lpParam);
 
 int main(void)
 {
 	int iResult;
 	int currentConnections = 0;
 	char recvbuf[DEFAULT_BUFLEN];
+
+	// niz char-ova u kom ce se nalaziti primljen podatak od klijenta
 	char recvData[10];
+	
+	// queue predstavlja kreiran red ciji je kapacitet 12 podataka
 	queue = createQueue(12);
-	task = createTasks(10);
 
 	SOCKET listenSocket = INVALID_SOCKET;
 
 	DWORD addToQueueThreadID;
-	DWORD sendToThreadPoolThreadID;
-	DWORD threadPoolThreadID[THREAD_POOL_SIZE];
+	DWORD loadBalancerThread1ID;
+	DWORD loadBalancerThread2ID;
 
 	HANDLE hAddToQueueThread;
-	HANDLE hSendToThreadPoolThread;
-	HANDLE hThreadPoolThread[THREAD_POOL_SIZE];
+	HANDLE hLoadBalancerThread1;
+	HANDLE hLoadBalancerThread2;
 
-	hAddToQueueSemaphore = CreateSemaphore(0, 0, 1, NULL);
+	hAddToQueueSemaphore = CreateSemaphore(0, 0, THREAD_POOL_SIZE, NULL);
 	if (hAddToQueueSemaphore) {
 		hAddToQueueThread = CreateThread(NULL, 0, &addToQueue, recvData, 0, &addToQueueThreadID);
 	}
 
-	hSendToThreadPoolSemaphore = CreateSemaphore(0, 0, 1, NULL);
-	if (hSendToThreadPoolSemaphore) {
-		hSendToThreadPoolThread = CreateThread(NULL, 0, &sendToThreadPool, NULL, 0, &sendToThreadPoolThreadID);
+	hLoadBalancerThread1Semaphore = CreateSemaphore(0, 0, THREAD_POOL_SIZE, NULL);
+	if (hLoadBalancerThread1Semaphore) {
+		hLoadBalancerThread1 = CreateThread(NULL, 0, &loadBalancerThread1, NULL, 0, &loadBalancerThread1ID);
 	}
 
-	hSendToWRSemaphore = CreateSemaphore(0, 0, 1, NULL);
-	if (hSendToWRSemaphore) {
-		for (int i = 0; i < THREAD_POOL_SIZE; i++) {
-			char temp[10];
-			itoa(i, temp, 10);
-			hThreadPoolThread[i] = CreateThread(NULL, 0, &sendToWR, temp, 0, &threadPoolThreadID[i]);
-		}
-	}
+	hLoadBalancerThread2 = CreateThread(NULL, 0, &loadBalancerThread2, NULL, 0, &loadBalancerThread2ID);
 
-	InitializeCriticalSection(&addToQueueCS);
-	InitializeCriticalSection(&getQueueDataCS);
-	InitializeCriticalSection(&tasksUpdateCS);
+	
+	InitializeCriticalSection(&QueueCS);
 
-	SOCKET acceptedSocket[MAX_CLIENT];
-	for (int i = 0; i < MAX_CLIENT; i++) {
-		acceptedSocket[i] = INVALID_SOCKET;
-	}
+	SOCKET acceptedSocket;	
+	acceptedSocket = INVALID_SOCKET;
 
 	if (InitializeWindowsSockets() == false)
 		return 1;
@@ -141,22 +177,21 @@ int main(void)
 	while (true) {
 		FD_ZERO(&readfds);
 
-		if (currentConnections < MAX_CLIENT)
+		if (currentConnections == 0)
 			FD_SET(listenSocket, &readfds);
-
-		for (int i = 0; i < currentConnections; i++) {
-			FD_SET(acceptedSocket[i], &readfds);
-		}
-
+		else
+			FD_SET(acceptedSocket, &readfds);
+		
 		int result = select(0, &readfds, NULL, NULL, &timeVal);
 		if (result == 0)
 			continue;
 		else if (result == SOCKET_ERROR)
 			break;
-		else {
+		else
+		{
 			if (FD_ISSET(listenSocket, &readfds)) {
-				acceptedSocket[currentConnections] = accept(listenSocket, NULL, NULL);
-				if (acceptedSocket[currentConnections] == INVALID_SOCKET) {
+				acceptedSocket = accept(listenSocket, NULL, NULL);
+				if (acceptedSocket == INVALID_SOCKET) {
 					printf("accept failed with error: %d\n", WSAGetLastError());
 					closesocket(listenSocket);
 					WSACleanup();
@@ -164,62 +199,58 @@ int main(void)
 				}
 
 				unsigned long mode = 1;
-				iResult = ioctlsocket(acceptedSocket[currentConnections], FIONBIO, &mode);
+				iResult = ioctlsocket(acceptedSocket, FIONBIO, &mode);
 				currentConnections++;
 			}
+		
+			if (FD_ISSET(acceptedSocket, &readfds)) {
+				iResult = recv(acceptedSocket, recvbuf, DEFAULT_BUFLEN, 0);
 
-			for (int i = 0; i < currentConnections; i++) {
-				if (acceptedSocket[i] != INVALID_SOCKET) {
-					iResult = recv(acceptedSocket[i], recvbuf, DEFAULT_BUFLEN, 0);
-
-					if (iResult > 0) {
-							memcpy(recvData, recvbuf, sizeof(recvbuf));
-							printf("Client sent: %s\n", recvData);
+				if (iResult > 0) {  
+						memcpy(recvData, recvbuf, sizeof(recvbuf));
+						printf("Client sent: %s\n", recvData);
 							
-							ReleaseSemaphore(hAddToQueueSemaphore, 1, NULL);
-
-					}
-					else if (iResult == 0) {
-						printf("Connection with client closed.\n");
-						closesocket(acceptedSocket[currentConnections]);
-						Decomposition(acceptedSocket, i, currentConnections);
-					}
-					else {
-						printf("recv failed with error: %d\n", WSAGetLastError());
-						closesocket(acceptedSocket[currentConnections]);
-					}
+						ReleaseSemaphore(hAddToQueueSemaphore, 1, NULL);
 				}
-			}
+				else if (iResult == 0) {
+					printf("Connection with client closed.\n");
+					closesocket(acceptedSocket);
+					currentConnections--;
+				}
+				else {
+					printf("recv failed with error: %d\n", WSAGetLastError());
+					closesocket(acceptedSocket);
+					currentConnections--;
+				}
+			}		
 		}
 	}
 
-	for (int i = 0; i < MAX_CLIENT; i++) {
-		iResult = shutdown(acceptedSocket[i], SD_SEND);
-		if (iResult == SOCKET_ERROR) {
-			printf("shutdown failed with error: %d\n", WSAGetLastError());
-			closesocket(acceptedSocket[i]);
-			WSACleanup();
-			return 1;
-		}
+	if (hAddToQueueThread)
+		WaitForSingleObject(hAddToQueueThread, INFINITE);
+	if (hLoadBalancerThread1)
+		WaitForSingleObject(hLoadBalancerThread1, INFINITE);
+	if (hLoadBalancerThread2)
+		WaitForSingleObject(hLoadBalancerThread2, INFINITE);
 
-		closesocket(acceptedSocket[i]);
+	iResult = shutdown(acceptedSocket, SD_SEND);
+	if (iResult == SOCKET_ERROR) {
+		printf("shutdown failed with error: %d\n", WSAGetLastError());
+		closesocket(acceptedSocket);
+		WSACleanup();
+		return 1;
 	}
+
+	closesocket(acceptedSocket);
 
 	SAFE_DELETE_HANDLE(hAddToQueueSemaphore);
 	SAFE_DELETE_HANDLE(hAddToQueueThread);
-	
-	SAFE_DELETE_HANDLE(hSendToThreadPoolSemaphore);
-	SAFE_DELETE_HANDLE(hSendToThreadPoolThread);
-	
-	SAFE_DELETE_HANDLE(hSendToWRSemaphore);
-	SAFE_DELETE_HANDLE(hThreadPoolThread);
+	SAFE_DELETE_HANDLE(hLoadBalancerThread1Semaphore);
+	SAFE_DELETE_HANDLE(hLoadBalancerThread1);
+	SAFE_DELETE_HANDLE(hLoadBalancerThread2);
 		
 	closesocket(listenSocket);
-
-	DeleteCriticalSection(&addToQueueCS);
-	DeleteCriticalSection(&getQueueDataCS);
-	DeleteCriticalSection(&tasksUpdateCS);
-	
+	DeleteCriticalSection(&QueueCS);
 	WSACleanup();
 
 	return 0;
@@ -235,21 +266,15 @@ bool InitializeWindowsSockets() {
 	return true;
 }
 
-void Decomposition(SOCKET* acceptedSockets, int indexDeleted, int indexCurrentSize) {
-	for (int i = indexDeleted; i < indexCurrentSize - 1; i++) {
-		acceptedSockets[i] = acceptedSockets[i + 1];
-	}
-}
-
 void WriteInFile(int data, int workerRole) {
-	const char* filename = "temp.txt";
+	const char* filename = "output.txt";
 
 	FILE *fp = fopen(filename, "a");
 	if (fp == NULL) {
 		printf("Error opening the file %s", filename);
 		return;
 	}
-	
+
 	fprintf(fp, "Worker role %d: %d\n", workerRole, data);
 	fclose(fp);
 }
@@ -257,50 +282,109 @@ void WriteInFile(int data, int workerRole) {
 DWORD WINAPI addToQueue(LPVOID lpParam) {
 	while (true) {
 		WaitForSingleObject(hAddToQueueSemaphore, INFINITE);
-		EnterCriticalSection(&addToQueueCS);
-			char* temp = (char*)lpParam;
-			enqueue(queue, atoi(temp));
-			printf("Enqueued data: %s\n", temp);
-			counter++;
-		LeaveCriticalSection(&addToQueueCS);
-
-		if (counter > 3)
-			ReleaseSemaphore(hSendToThreadPoolSemaphore, 1, NULL);
-	}
-}
-
-DWORD WINAPI sendToThreadPool(LPVOID lpParam) {
-	int tempData;
-	while (true) {
-		WaitForSingleObject(hSendToThreadPoolSemaphore, INFINITE);
-
-		EnterCriticalSection(&getQueueDataCS);
-			//preuzmi podatak iz reda
-			tempData = dequeue(queue);
-		LeaveCriticalSection(&getQueueDataCS);
 		
-		EnterCriticalSection(&tasksUpdateCS);
-			//kreiranje novog taska
-			addTask(task, tempData);
-			tasksCount++;
-		LeaveCriticalSection(&tasksUpdateCS);
+		EnterCriticalSection(&QueueCS);
+			char* temp = (char*)lpParam;
+			
+			if (!enqueue(queue, atoi(temp))) {
+				printf("Q is full!");
+				return -1;
+			}
 
-		if (tasksCount > 3)
-			ReleaseSemaphore(hSendToWRSemaphore, 1, NULL);
+			printf("Enqueued data: %s\n", temp);
+		LeaveCriticalSection(&QueueCS);
+		
+		ReleaseSemaphore(hLoadBalancerThread1Semaphore, 1, NULL);
 	}
+
+	return 0;
 }
 
-DWORD WINAPI sendToWR(LPVOID lpParam) {
+DWORD WINAPI loadBalancerThread1(LPVOID lpParam) {
 	while (true) {
-		WaitForSingleObject(hSendToWRSemaphore, INFINITE);
+		WaitForSingleObject(hLoadBalancerThread1Semaphore, INFINITE);
+		
+		bool found = false;
+		while(!found) {
+			if (!busyThreads[counter]) {
+				ReleaseSemaphore(hThreadPoolSemaphore[counter], 1, NULL);
+				busyThreads[counter] = true;
+				printf("Sent to workerRole %d.\n", counter);
+				found = true;
+			}
 
-		EnterCriticalSection(&tasksUpdateCS);
-			//preuzimanje taska i prosledjivanje metodi writeInFile		
-			WriteInFile(getTask(task), atoi((char*)lpParam));
-			tasksCount--;
-		LeaveCriticalSection(&tasksUpdateCS);
-
-		if (tasksCount > 0)
-			ReleaseSemaphore(hSendToWRSemaphore, 1, NULL);
+			counter++;
+			counter = counter % numOfWorkerRoles;
+		} 		
 	}
+	return 0;
 }
+
+DWORD WINAPI loadBalancerThread2(LPVOID lpParam) {
+	DWORD threadPoolThreadID[THREAD_POOL_SIZE];
+	numOfWorkerRoles = 3;
+
+	for (int i = 0; i < THREAD_POOL_SIZE; i++) {
+		busyThreads[i] = false;
+	}
+
+	for (int i = 0; i < numOfWorkerRoles; i++) {
+		hThreadPoolSemaphore[i] = CreateSemaphore(0, 0, 1, NULL);
+		hThreadPoolSemaphoreFinish[i] = CreateSemaphore(0, 0, 1, NULL);
+		if (hThreadPoolSemaphore[i] && hThreadPoolSemaphoreFinish[i]) {
+			hThreadPoolThread[i] = CreateThread(NULL, 0, &workerRole, (LPVOID)i, 0, &threadPoolThreadID[i]);
+		}	
+	}
+	
+	while (true)
+	{
+		double result = ((double)queue->size / (double)queue->capacity) * 100;
+		printf("Current size of Q is: %.2f %%\n", result);
+
+		if (result > 70) {
+			hThreadPoolSemaphore[numOfWorkerRoles] = CreateSemaphore(0, 0, 1, NULL);
+			hThreadPoolSemaphoreFinish[numOfWorkerRoles] = CreateSemaphore(0, 0, 1, NULL);
+
+			if (hThreadPoolSemaphore[numOfWorkerRoles] && hThreadPoolSemaphoreFinish[numOfWorkerRoles]) {
+				hThreadPoolThread[numOfWorkerRoles] = CreateThread(NULL, 0, &workerRole, (LPVOID)numOfWorkerRoles, 0, &threadPoolThreadID[numOfWorkerRoles]);
+				numOfWorkerRoles++;
+			}
+		}
+		else if (result < 30 && numOfWorkerRoles > 1) {
+			ReleaseSemaphore(hThreadPoolSemaphoreFinish[numOfWorkerRoles - 1], 1, NULL);
+			numOfWorkerRoles--;
+		}
+		
+		Sleep(2000);
+	}
+
+	return 0;
+}
+
+DWORD WINAPI workerRole(LPVOID lpParam) {
+	int n = (int)lpParam;
+	const int semaphore_num = 2;
+	HANDLE semaphores[semaphore_num] = { hThreadPoolSemaphoreFinish[n],hThreadPoolSemaphore[n] };
+		
+	while (WaitForMultipleObjects(semaphore_num, semaphores, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
+		EnterCriticalSection(&QueueCS);
+			//preuzmi podatak iz reda
+			int workerRoleData = dequeue(queue);
+		LeaveCriticalSection(&QueueCS);
+
+		//ukoliko je red prezan vratice -1 i izaci ce iz ove petlje
+		if (workerRoleData == -1)
+			break;
+
+		Sleep(7000);
+		WriteInFile(workerRoleData, n);
+		printf("Hello from workerRole %d. Dequeued data: %d\n", n, workerRoleData);
+		
+		busyThreads[n] = false;
+	}
+
+	SAFE_DELETE_HANDLE(hThreadPoolSemaphore[n]);
+	SAFE_DELETE_HANDLE(hThreadPoolSemaphoreFinish[n]);
+	SAFE_DELETE_HANDLE(hThreadPoolThread[n]);
+	return 0;
+} 

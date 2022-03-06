@@ -59,15 +59,17 @@ int isEmpty(struct Queue* queue)
 
 	Povratna vrednost: /
 */
-void enqueue(struct Queue* queue, int item)
+bool enqueue(struct Queue* queue, int item)
 {
 	if (isFull(queue))
-		return;
+		return false;
 	queue->rear = (queue->rear + 1)
 		% queue->capacity;
 	queue->array[queue->rear] = item;
 	queue->size = queue->size + 1;
 	printf("%d enqueued to queue\n", item);
+
+	return true;
 }
 
 /*
@@ -82,7 +84,7 @@ void enqueue(struct Queue* queue, int item)
 int dequeue(struct Queue* queue)
 {
 	if (isEmpty(queue))
-		return INT_MIN;
+		return -1;
 	int item = queue->array[queue->front];
 	queue->front = (queue->front + 1)
 		% queue->capacity;

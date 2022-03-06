@@ -13,5 +13,5 @@ struct Queue {
 struct Queue* createQueue(unsigned capacity);
 int isFull(struct Queue* queue);
 int isEmpty(struct Queue* queue);
-void enqueue(struct Queue* queue, int item);
+bool enqueue(struct Queue* queue, int item);
 int dequeue(struct Queue* queue);

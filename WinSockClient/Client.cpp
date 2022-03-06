@@ -7,8 +7,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <conio.h>
+#include <time.h>
 
-#define DEFAULT_PORT 27016
+#define DEFAULT_PORT 5059
 
 bool InitializeWindowsSockets();
 
@@ -39,11 +40,15 @@ int __cdecl main(int argc, char **argv)
 	}
 
 	int data = 0;
+	printf("Client is started working...Press any key to stop.\n\n");
 	do {
-		// slanje podatka
-		char temp[10];
+		//logika za dobijanje random broja koji se salje serveru
+		srand(time(0));
+		data = rand() % 100 + 1;
+		
+		// slanje podatka serveru
+		char temp[10];		
 		itoa(data, temp, 10);
-
 		iResult = send(connectSocket, temp, (int)sizeof(data), 0);
 		if (iResult == SOCKET_ERROR) {
 			printf("send failed with error: %d\n", WSAGetLastError());
@@ -52,9 +57,10 @@ int __cdecl main(int argc, char **argv)
 			return 1;
 		}
 
-		data++;
+		printf("%d was successfully sent to Server\n", data);
+
 		Sleep(1500);
-	} while (true);
+	} while (!kbhit());
 
 	closesocket(connectSocket);
 	WSACleanup();
@@ -62,12 +68,10 @@ int __cdecl main(int argc, char **argv)
 	return 0;
 }
 
-bool InitializeWindowsSockets()
-{
+bool InitializeWindowsSockets() {
 	WSADATA wsaData;
 
-	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
-	{
+	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
 		printf("WSAStartup failed with error: %d\n", WSAGetLastError());
 		return false;
 	}
